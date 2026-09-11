@@ -1003,6 +1003,9 @@ Item {
           for (var ap2 = 0; ap2 < appRowsSearch.length && displayModel.count < root.maxResults; ap2++)
             displayModel.append(appRowsSearch[ap2])
         }
+
+        for (var fj = 0; fj < root.fileResults.length && displayModel.count < root.maxResults; fj++)
+          displayModel.append(root.fileResults[fj])
       }
     } else if (root.activeMenu === "root") {
       var takenRoot = {}
