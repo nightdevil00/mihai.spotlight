@@ -20,6 +20,27 @@ Item {
   property var pathBins: ({})
   property var pendingBins: ({})
 
+  // Omarchy menu integration: parsed + merged JSONC sources (default menu
+  // + the user extension at ~/.config/omarchy/extensions/omarchy-menu.jsonc),
+  // plus the batched `when:`/`checked:` guard results.
+  property var defaultMenuItems: []
+  property var userMenuItems: []
+  property var menuItems: ({})
+  property var menuOrder: []
+  property var whenResults: ({})
+  property var checkedResults: ({})
+  property bool menuRowsLoaded: false
+  property bool menuGuardsPending: false
+  readonly property string defaultMenuPath: root.omarchyPath + "/default/omarchy/omarchy-menu.jsonc"
+  readonly property string userMenuPath: Quickshell.env("HOME") + "/.config/omarchy/extensions/omarchy-menu.jsonc"
+  readonly property int maxMenuRows: 8
+  readonly property int maxMenuListRows: 200
+  property string activeMenu: "root"
+  property var menuNav: []
+  property bool fontRowsLoaded: false
+  property var fontRows: []
+  readonly property string fontProviderScript: "current=$(omarchy-font-current 2>/dev/null); omarchy-font-list 2>/dev/null | while read -r f; do [[ -z $f ]] && continue; printf '%s\\t%s\\t%s\\n' \"$f\" \"$f\" \"$current\"; done"
+
   property color background: Color.menu.background
   property color foreground: Color.menu.text
   property color border: Color.menu.border
@@ -43,9 +64,17 @@ Item {
     root.opened = true
     root.filterText = ""
     root.selectedIndex = 0
+    root.activeMenu = "root"
+    root.menuNav = []
     root.fileResults = []
     root.cancelScan()
     if (!binScan.running) binScan.running = true
+    if (!root.menuRowsLoaded) {
+      defaultMenuFile.reload()
+      userMenuFile.reload()
+    } else {
+      root.evaluateMenuGuards()
+    }
     root.rebuildDisplay()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -89,6 +118,483 @@ Item {
       else out += escapeRegex(c)
     }
     return out
+  }
+
+  // ------------------------------------------------------------------
+  // Omarchy menu integration. Parses the same JSONC sources the
+  // `omarchy.menu` plugin uses, merges user overrides on top of the
+  // defaults, evaluates every `when:`/`checked:` guard in one batch, and
+  // exposes the whole tree in Spotlight itself: submenu rows drill into
+  // their section right here (no external menu summons), action rows run
+  // their command directly, and the provider-backed menus (Apps, Fonts)
+  // surface their rows natively.
+  // ------------------------------------------------------------------
+
+  function stripMenuJsonc(raw) {
+    return String(raw || "")
+      .replace(/^\s*\/\/[^\n]*(\n|$)/gm, "")
+      .replace(/,(\s*[}\]])/g, "$1")
+  }
+
+  function normalizeMenuAliases(value) {
+    if (Array.isArray(value)) return value.filter(function(v) { return v })
+    if (typeof value === "string" && value) return [value]
+    return []
+  }
+
+  function normalizeMenuItem(id, raw) {
+    var value = raw || {}
+    var aliases = root.normalizeMenuAliases(value.aliases)
+    var parent = value.parent
+    if (parent === undefined)
+      parent = id.indexOf(".") >= 0 ? id.split(".").slice(0, -1).join(".") : "root"
+    if (id === "root") parent = ""
+    var kind = value.action ? "action" : (value.target ? "link" : "menu")
+    return {
+      id: id,
+      parent: parent,
+      kind: kind,
+      icon: value.icon || "",
+      label: value.label || id,
+      target: value.target || "",
+      description: value.description || "",
+      action: value.action || "",
+      provider: value.provider || "",
+      aliases: aliases,
+      when: value.when || "",
+      checked: value.checked || ""
+    }
+  }
+
+  function parseMenuJsonc(raw) {
+    var stripped = root.stripMenuJsonc(raw)
+    if (!stripped.trim()) return []
+    var parsed
+    try { parsed = JSON.parse(stripped) } catch (e) { return [] }
+    if (typeof parsed !== "object" || parsed === null) return []
+    var source = (parsed.items && typeof parsed.items === "object" && !Array.isArray(parsed.items))
+      ? parsed.items
+      : parsed
+    var out = []
+    for (var id in source) {
+      var entry = source[id]
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
+      out.push(root.normalizeMenuItem(id, entry))
+    }
+    return out
+  }
+
+  function mergeMenuSources(defaultItems, userItems) {
+    var nextItems = ({})
+    var nextOrder = []
+    var sources = [defaultItems || [], userItems || []]
+    for (var s = 0; s < sources.length; s++) {
+      var src = sources[s]
+      for (var i = 0; i < src.length; i++) {
+        var entry = src[i]
+        if (!entry || !entry.id) continue
+        if (!nextItems[entry.id]) nextOrder.push(entry.id)
+        var prior = nextItems[entry.id] || {}
+        var merged = {}
+        for (var k in prior) merged[k] = prior[k]
+        for (var k2 in entry) merged[k2] = entry[k2]
+        merged.id = entry.id
+        nextItems[entry.id] = merged
+      }
+    }
+    if (!nextItems.root) {
+      nextItems.root = { id: "root", parent: "", kind: "menu", icon: "", label: "Go", target: "", description: "", action: "", provider: "", aliases: [], when: "", checked: "" }
+      nextOrder.unshift("root")
+    }
+    for (var k3 = 0; k3 < nextOrder.length; k3++) nextItems[nextOrder[k3]].order = k3
+    return { items: nextItems, itemOrder: nextOrder }
+  }
+
+  function rebuildMenuItems() {
+    var merged = root.mergeMenuSources(root.defaultMenuItems, root.userMenuItems)
+    root.menuItems = merged.items
+    root.menuOrder = merged.itemOrder
+    root.menuRowsLoaded = true
+    root.evaluateMenuGuards()
+    if (root.opened) root.rebuildDisplay()
+  }
+
+  function menuItemById(id) {
+    return root.menuItems[id] || null
+  }
+
+  function menuDepth(id) {
+    var depth = 0
+    var current = root.menuItemById(id)
+    var guard = 0
+    while (current && current.parent && current.parent !== "root" && guard < 24) {
+      depth += 1
+      current = root.menuItemById(current.parent)
+      guard += 1
+    }
+    return depth
+  }
+
+  function menuParentPath(id) {
+    var labels = []
+    var current = root.menuItemById(id)
+    if (!current || !current.parent || current.parent === "root") return ""
+    current = root.menuItemById(current.parent)
+    var guard = 0
+    while (current && current.id !== "root" && guard < 24) {
+      labels.unshift(current.label)
+      current = root.menuItemById(current.parent)
+      guard += 1
+    }
+    return labels.join(" › ")
+  }
+
+  function menuHasVisibleChild(targetId, depth) {
+    if (depth === undefined) depth = 0
+    if (depth >= 16) return false
+    for (var i = 0; i < root.menuOrder.length; i++) {
+      var child = root.menuItemById(root.menuOrder[i])
+      if (child && child.parent === targetId && root.menuItemVisible(child, depth + 1)) return true
+    }
+    return false
+  }
+
+  function menuItemVisible(entry, depth) {
+    if (!entry) return false
+    if (entry.when && root.whenResults[entry.id] === false) return false
+    if (entry.kind !== "menu" && entry.kind !== "link") return true
+    if (entry.provider) return true
+    var target = entry.kind === "link" ? entry.target : entry.id
+    return root.menuHasVisibleChild(target, depth || 0)
+  }
+
+  function menuSearchText(entry) {
+    var aliases = ""
+    var values = Array.isArray(entry.aliases) ? entry.aliases : []
+    for (var i = 0; i < values.length; i++)
+      if (values[i]) aliases += " " + String(values[i]).replace(/[._-]+/g, " ")
+    var leaf = String(entry.id.split(".").pop() || "").replace(/[._-]+/g, " ")
+    return (entry.label + " " + leaf + aliases).toLowerCase()
+  }
+
+  function menuDescriptionHasTerm(term, text) {
+    var words = String(text || "").toLowerCase().split(/\s+/)
+    for (var i = 0; i < words.length; i++) if (words[i] === term) return true
+    return false
+  }
+
+  function menuMatches(entry, terms) {
+    var nameText = root.menuSearchText(entry)
+    var descriptionText = String(entry.description || "").toLowerCase()
+    for (var i = 0; i < terms.length; i++) {
+      if (!terms[i]) continue
+      if (nameText.indexOf(terms[i]) >= 0) continue
+      if (root.menuDescriptionHasTerm(terms[i], descriptionText)) continue
+      return false
+    }
+    return true
+  }
+
+  function menuSearchScore(entry, query) {
+    var needle = String(query || "").toLowerCase().trim()
+    var label = entry.label.toLowerCase()
+    var nameText = root.menuSearchText(entry)
+    var descriptionText = String(entry.description || "").toLowerCase()
+    var score = 80
+    if (label === needle) score = entry.parent === "root" ? 2 : 0
+    else if (label.indexOf(needle) === 0) score = 10
+    else if (label.indexOf(needle) >= 0) score = 30
+    else if (nameText.indexOf(needle) >= 0) score = 40
+    else if (root.menuDescriptionHasTerm(needle, descriptionText)) score = 60
+    if (entry.kind === "menu" || entry.kind === "link") score -= 2
+    return score * 1000 + root.menuDepth(entry.id) * 25 + entry.order
+  }
+
+  function matchingMenuRows(query, taken) {
+    var q = String(query || "").trim().toLowerCase()
+    if (q.length < 2) return []
+    var terms = q.split(/\s+/)
+    var rows = []
+    for (var i = 0; i < root.menuOrder.length; i++) {
+      var entry = root.menuItemById(root.menuOrder[i])
+      if (!entry || entry.id === "root") continue
+      if (!root.menuItemVisible(entry)) continue
+      if (!root.menuInScope(entry.id)) continue
+      if (!root.menuMatches(entry, terms)) continue
+      var label = entry.checked && root.checkedResults[entry.id] ? entry.label + " ✓" : entry.label
+      var takenName = label.toLowerCase()
+      if (taken && taken[takenName] !== undefined) continue
+      var parent = root.menuParentPath(entry.id)
+      var row = {
+        kind: entry.action ? "action" : "menu",
+        name: label,
+        subtitle: parent || entry.description || "Omarchy menu",
+        icon: entry.icon || "",
+        arg: entry.action || "",
+        menuId: entry.id
+      }
+      row.menuScore = root.menuSearchScore(entry, q)
+      if (taken) taken[takenName] = true
+      rows.push(row)
+    }
+    rows.sort(function(a, b) { return a.menuScore - b.menuScore })
+    return rows.slice(0, root.maxMenuRows)
+  }
+
+  // The root view of the Omarchy menu: its top-level sections (Apps, Learn,
+  // Trigger, Style, ...) listed in menu order, guards applied. This is what
+  // Spotlight shows when it opens, so it starts exactly like the real menu.
+  function menuRootRows(taken) {
+    var rows = []
+    for (var i = 0; i < root.menuOrder.length; i++) {
+      var entry = root.menuItemById(root.menuOrder[i])
+      if (!entry || entry.id === "root" || entry.parent !== "root") continue
+      if (!root.menuItemVisible(entry)) continue
+      var label = entry.checked && root.checkedResults[entry.id] ? entry.label + " ✓" : entry.label
+      var takenName = label.toLowerCase()
+      if (taken && taken[takenName] !== undefined) continue
+      rows.push({
+        kind: "menu",
+        name: label,
+        subtitle: entry.description || "Omarchy menu",
+        icon: entry.icon || "",
+        arg: "",
+        menuId: entry.id
+      })
+      if (taken) taken[takenName] = true
+    }
+    return rows
+  }
+
+  // ---- in-Spotlight menu navigation -------------------------------------
+  //
+  // Spotlight is the menu: activating a submenu row drills into its section
+  // here, action rows run their command, links follow their target, and the
+  // external menu plugin is never summoned.
+
+  function menuEntryTarget(id) {
+    var entry = root.menuItemById(id)
+    return entry && entry.kind === "link" && entry.target ? entry.target : id
+  }
+
+  function menuGoTo(id) {
+    var target = root.menuEntryTarget(id)
+    if (!root.menuItems[target]) return
+    root.menuNav = root.menuNav.concat([root.activeMenu])
+    root.activeMenu = target
+    root.filterText = ""
+    root.selectedIndex = 0
+    if (target === "style.font") root.startFontProvider()
+    root.rebuildDisplay()
+  }
+
+  function menuGoBack() {
+    if (root.activeMenu === "root") return
+    var previous = "root"
+    if (root.menuNav.length > 0) {
+      previous = root.menuNav[root.menuNav.length - 1]
+      root.menuNav = root.menuNav.slice(0, root.menuNav.length - 1)
+    } else {
+      var cur = root.menuItemById(root.activeMenu)
+      previous = cur && cur.parent ? cur.parent : "root"
+    }
+    root.activeMenu = previous
+    root.filterText = ""
+    root.selectedIndex = 0
+    root.rebuildDisplay()
+  }
+
+  function menuBreadcrumb() {
+    if (root.activeMenu === "root") return ""
+    var labels = []
+    var cur = root.menuItemById(root.activeMenu)
+    var guard = 0
+    while (cur && cur.id !== "root" && guard < 24) {
+      labels.unshift(cur.label)
+      cur = root.menuItemById(cur.parent)
+      guard += 1
+    }
+    return labels.join(" › ")
+  }
+
+  function headerHint() {
+    if (root.filterText) return root.filterText
+    if (root.activeMenu === "root")
+      return "Search apps, files, extensions, commands, math, URLs…"
+    return "‹ " + root.menuBreadcrumb()
+  }
+
+  // Search is scoped to the current menu, mirroring the real menu: at the
+  // root it covers the whole tree; inside a submenu only that subtree.
+  function menuInScope(id) {
+    if (root.activeMenu === "root") return true
+    var cur = root.menuItemById(id)
+    while (cur && cur.id !== "root") {
+      if (cur.id === root.activeMenu) return true
+      cur = root.menuItemById(cur.parent)
+    }
+    return false
+  }
+
+  function menuChildRows(taken) {
+    var rows = []
+    for (var i = 0; i < root.menuOrder.length; i++) {
+      var entry = root.menuItemById(root.menuOrder[i])
+      if (!entry || entry.parent !== root.activeMenu) continue
+      if (!root.menuItemVisible(entry)) continue
+      var label = entry.checked && root.checkedResults[entry.id] ? entry.label + " ✓" : entry.label
+      var takenName = label.toLowerCase()
+      if (taken && taken[takenName] !== undefined) continue
+      var isAction = entry.kind === "action" && entry.action
+      rows.push({
+        kind: isAction ? "action" : "menu",
+        name: label,
+        subtitle: entry.description || (entry.provider ? "Opening…" : ""),
+        icon: entry.icon || "",
+        arg: entry.action || "",
+        menuId: entry.id
+      })
+      if (taken) taken[takenName] = true
+    }
+    return rows
+  }
+
+  function appRows(query, taken) {
+    var apps = root.sortedApps(query || "")
+    var rows = []
+    for (var i = 0; i < apps.length; i++) {
+      var e = apps[i].entry
+      var name = root.appName(e)
+      var takenName = name.toLowerCase()
+      if (taken && taken[takenName] !== undefined) continue
+      rows.push({ kind: "app", name: name, subtitle: root.appSubtext(e), icon: String(e.icon || ""), arg: String(e.id || "") })
+      if (taken) taken[takenName] = true
+    }
+    return rows
+  }
+
+  // The font list is a shell provider in the real menu; mirror it so Style ›
+  // Font stays functional inside Spotlight.
+  function parseFontRows(output) {
+    var lines = String(output || "").split("\n")
+    var rows = []
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim()
+      if (!line) continue
+      var parts = line.split("\t")
+      var label = parts[0] || ""
+      var value = parts[1] || parts[0] || ""
+      var current = parts[2] || ""
+      if (!label) continue
+      rows.push({
+        kind: "action",
+        name: label,
+        subtitle: value === current ? "Current font" : "Set as default",
+        icon: value === current ? "✓" : "",
+        arg: value === current ? "" : "omarchy-font-set " + Util.shellQuote(value)
+      })
+    }
+    return rows
+  }
+
+  function startFontProvider() {
+    if (root.fontRowsLoaded || fontProc.running) return
+    fontProc.collected = ""
+    fontProc.command = ["bash", "-lc", root.fontProviderScript]
+    fontProc.running = true
+  }
+
+  function matchingFontRows(query, taken) {
+    var q = String(query || "").trim().toLowerCase()
+    var rows = []
+    for (var i = 0; i < root.fontRows.length; i++) {
+      var row = root.fontRows[i]
+      if (q && row.name.toLowerCase().indexOf(q) < 0) continue
+      var takenName = row.name.toLowerCase()
+      if (taken && taken[takenName] !== undefined) continue
+      rows.push(row)
+      if (taken) taken[takenName] = true
+    }
+    return rows.slice(0, root.maxMenuRows)
+  }
+
+  // ---- when:/checked: guards, batched into one bash process like the menu.
+
+  readonly property var menuGuardReaders: [
+    "omarchy-channel-current",
+    "omarchy-default-agent",
+    "omarchy-default-browser",
+    "omarchy-default-editor",
+    "omarchy-default-terminal",
+    "omarchy-dns"
+  ]
+
+  function menuGuardReaderSlot(index) {
+    return "${__omarchy_read_" + index + "}"
+  }
+
+  function menuSubstituteGuardReaders(expression) {
+    for (var i = 0; i < root.menuGuardReaders.length; i++)
+      expression = expression.split("$(" + root.menuGuardReaders[i] + ")").join(root.menuGuardReaderSlot(i))
+    return expression
+  }
+
+  function menuGuardHelpers() {
+    return 'declare -A __omarchy_pkgs=()\n'
+      + 'mapfile -t __omarchy_pkg_names < <({ pacman -Qq; LC_ALL=C pacman -Qi'
+      + " | awk '/^[A-Za-z]/ { provides = ($0 ~ /^Provides/); sub(/^[^:]*: /, \"\") }"
+      + ' provides && $0 != "None" { n = split($0, p, " ");'
+      + ' for (i = 1; i <= n; i++) { sub(/[<>=].*/, "", p[i]); print p[i] } }\'; } 2>/dev/null)\n'
+      + 'for __omarchy_pkg in "${__omarchy_pkg_names[@]}"; do __omarchy_pkgs[$__omarchy_pkg]=1; done\n'
+      + '__omarchy_pkg_has() { [[ -n ${__omarchy_pkgs[$1]-} ]] && return 0; '
+      + '[[ $1 == *[\\<\\>=]* ]] && { pacman -Q "$1" &>/dev/null; return; }; return 1; }\n'
+      + 'omarchy-pkg-present() { local p; for p in "$@"; do __omarchy_pkg_has "$p" || return 1; done; return 0; }\n'
+      + 'omarchy-pkg-missing() { local p; for p in "$@"; do __omarchy_pkg_has "$p" || return 0; done; return 1; }\n'
+      + 'omarchy-cmd-present() { local c; for c in "$@"; do command -v "$c" &>/dev/null || return 1; done; return 0; }\n'
+      + 'omarchy-cmd-missing() { local c; for c in "$@"; do command -v "$c" &>/dev/null || return 0; done; return 1; }\n'
+  }
+
+  function menuGuardPrelude(guards) {
+    var prelude = root.menuGuardHelpers()
+    for (var i = 0; i < root.menuGuardReaders.length; i++) {
+      if (guards.indexOf(root.menuGuardReaderSlot(i)) < 0) continue
+      prelude += "__omarchy_read_" + i + "=$(" + root.menuGuardReaders[i] + " 2>/dev/null) || :\n"
+    }
+    return prelude
+  }
+
+  function menuGuardLine(id, tag, expression) {
+    return "if { " + root.menuSubstituteGuardReaders(expression) + "; } >/dev/null 2>&1; then echo "
+      + id + ":" + tag + ":1; else echo " + id + ":" + tag + ":0; fi\n"
+  }
+
+  function menuGuardScript() {
+    var guards = ""
+    var ids = Object.keys(root.menuItems || {})
+    for (var i = 0; i < ids.length; i++) {
+      var entry = root.menuItems[ids[i]]
+      if (!entry) continue
+      if (entry.when) guards += root.menuGuardLine(ids[i], "w", entry.when)
+      if (entry.checked) guards += root.menuGuardLine(ids[i], "c", entry.checked)
+    }
+    return guards ? root.menuGuardPrelude(guards) + guards : ""
+  }
+
+  function evaluateMenuGuards() {
+    if (menuGuardProc.running) {
+      root.menuGuardsPending = true
+      return
+    }
+    root.menuGuardsPending = false
+    var script = root.menuGuardScript()
+    if (!script) {
+      root.whenResults = ({})
+      root.checkedResults = ({})
+      return
+    }
+    menuGuardProc.collected = ""
+    menuGuardProc.command = ["bash", "-lc", script]
+    menuGuardProc.running = true
   }
 
   readonly property var actions: [
@@ -436,6 +942,9 @@ Item {
     displayModel.clear()
 
     var q = root.filterText.trim()
+    var activeEntry = root.menuItemById(root.activeMenu)
+    var activeProvider = activeEntry && activeEntry.provider ? activeEntry.provider : ""
+
     if (q) {
       var calc = calcValue(q)
       if (calc !== null)
@@ -459,27 +968,65 @@ Item {
         if (nm) taken[nm] = true
       }
 
-      var bins = binaryMatches(extensionQuery(q).length > 0 ? "" : q, taken)
-      for (var b = 0; b < bins.length && displayModel.count < root.maxResults; b++)
-        displayModel.append(bins[b])
+      if (activeProvider === "apps") {
+        var appSearch = root.appRows(q, taken)
+        for (var as2 = 0; as2 < appSearch.length && displayModel.count < root.maxResults; as2++)
+          displayModel.append(appSearch[as2])
+      } else if (activeProvider === "fonts") {
+        var fontSearch = root.matchingFontRows(q, taken)
+        for (var fs2 = 0; fs2 < fontSearch.length && displayModel.count < root.maxResults; fs2++)
+          displayModel.append(fontSearch[fs2])
+      } else {
+        var bins = binaryMatches(extensionQuery(q).length > 0 ? "" : q, taken)
+        for (var b = 0; b < bins.length && displayModel.count < root.maxResults; b++)
+          displayModel.append(bins[b])
 
-      var acts = matchingActions(q)
-      for (var a = 0; a < acts.length && displayModel.count < root.maxResults; a++)
-        displayModel.append(acts[a])
+        var acts = matchingActions(q)
+        for (var a = 0; a < acts.length && displayModel.count < root.maxResults; a++)
+          displayModel.append(acts[a])
 
-      var folders = matchingFolders(q)
-      for (var f = 0; f < folders.length && displayModel.count < root.maxResults; f++)
-        displayModel.append(folders[f])
+        for (var t2 = 0; t2 < displayModel.count; t2++) {
+          var nm2 = String(displayModel.get(t2).name || "").toLowerCase()
+          if (nm2) taken[nm2] = true
+        }
+
+        var menuRows = matchingMenuRows(q, taken)
+        for (var m = 0; m < menuRows.length && displayModel.count < root.maxResults; m++)
+          displayModel.append(menuRows[m])
+
+        if (root.activeMenu === "root") {
+          var folders = matchingFolders(q)
+          for (var f = 0; f < folders.length && displayModel.count < root.maxResults; f++)
+            displayModel.append(folders[f])
+
+          var appRowsSearch = root.appRows(q, taken)
+          for (var ap2 = 0; ap2 < appRowsSearch.length && displayModel.count < root.maxResults; ap2++)
+            displayModel.append(appRowsSearch[ap2])
+        }
+      }
+    } else if (root.activeMenu === "root") {
+      var takenRoot = {}
+      var menuRoots = root.menuRootRows(takenRoot)
+      for (var mr = 0; mr < menuRoots.length && displayModel.count < root.maxResults; mr++)
+        displayModel.append(menuRoots[mr])
+    } else if (activeProvider === "apps") {
+      var appList = root.appRows("", {})
+      for (var al = 0; al < appList.length && displayModel.count < root.maxMenuListRows; al++)
+        displayModel.append(appList[al])
+    } else if (activeProvider === "fonts") {
+      if (root.fontRowsLoaded) {
+        for (var fr = 0; fr < root.fontRows.length && displayModel.count < root.maxMenuListRows; fr++)
+          displayModel.append(root.fontRows[fr])
+      } else {
+        displayModel.append({ kind: "action", name: "Loading fonts…", subtitle: "", icon: "", arg: "" })
+        root.startFontProvider()
+      }
+    } else {
+      var takenChild = {}
+      var children = root.menuChildRows(takenChild)
+      for (var mc = 0; mc < children.length && displayModel.count < root.maxMenuListRows; mc++)
+        displayModel.append(children[mc])
     }
-
-    var apps = sortedApps(q)
-    for (var i = 0; i < apps.length && displayModel.count < root.maxResults; i++) {
-      var e = apps[i].entry
-      displayModel.append({ kind: "app", name: appName(e), subtitle: appSubtext(e), icon: String(e.icon || ""), arg: String(e.id || "") })
-    }
-
-    for (var j = 0; j < root.fileResults.length && displayModel.count < root.maxResults; j++)
-      displayModel.append(root.fileResults[j])
 
     if (displayModel.count === 0) root.selectedIndex = 0
     else if (root.selectedIndex >= displayModel.count) root.selectedIndex = displayModel.count - 1
@@ -495,7 +1042,16 @@ Item {
   function activateIndex(index) {
     if (index < 0 || index >= displayModel.count) return
     var row = displayModel.get(index)
-    if (!row.arg) return
+    if (!row.arg && !row.menuAction && row.kind !== "menu") return
+    if (row.kind === "menu") {
+      if (row.menuAction) {
+        root.dismiss()
+        Util.execDetached(row.menuAction)
+      } else {
+        root.menuGoTo(row.menuId || "")
+      }
+      return
+    }
     root.dismiss()
     if (row.kind === "app")
       Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(row.arg + ".desktop"))
@@ -563,6 +1119,76 @@ Item {
     onExited: root.pathBins = root.pendingBins
   }
 
+  Process {
+    id: fontProc
+    property string collected: ""
+    stdout: SplitParser {
+      onRead: function(data) { fontProc.collected += data + "\n" }
+    }
+    onExited: function(exitCode, exitStatus) {
+      if (exitCode === 0 && exitStatus === 0) {
+        root.fontRows = root.parseFontRows(fontProc.collected)
+        root.fontRowsLoaded = true
+        if (root.opened) root.rebuildDisplay()
+      }
+    }
+  }
+
+  FileView {
+    id: defaultMenuFile
+    path: root.defaultMenuPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: { root.defaultMenuItems = root.parseMenuJsonc(text()); root.rebuildMenuItems() }
+    onFileChanged: reload()
+  }
+
+  FileView {
+    id: userMenuFile
+    path: root.userMenuPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: { root.userMenuItems = root.parseMenuJsonc(text()); root.rebuildMenuItems() }
+    onLoadFailed: { root.userMenuItems = []; root.rebuildMenuItems() }
+    onFileChanged: reload()
+  }
+
+  Process {
+    id: menuGuardProc
+    property string collected: ""
+    stdout: SplitParser {
+      onRead: function(data) { menuGuardProc.collected += data + "\n" }
+    }
+    onExited: function(exitCode, exitStatus) {
+      var healthy = exitCode === 0 && exitStatus === 0
+      if (!healthy) {
+        if (root.menuGuardsPending) Qt.callLater(function() { root.evaluateMenuGuards() })
+        return
+      }
+      var nextWhen = ({})
+      var nextChecked = ({})
+      var lines = menuGuardProc.collected.split("\n")
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim()
+        if (!line) continue
+        var colon = line.lastIndexOf(":")
+        if (colon < 0) continue
+        var value = line.substring(colon + 1) === "1"
+        var rest = line.substring(0, colon)
+        var tagAt = rest.lastIndexOf(":")
+        if (tagAt < 0) continue
+        var id = rest.substring(0, tagAt)
+        var tag = rest.substring(tagAt + 1)
+        if (tag === "w") nextWhen[id] = value
+        else if (tag === "c") nextChecked[id] = value
+      }
+      root.whenResults = nextWhen
+      root.checkedResults = nextChecked
+      if (root.opened) root.rebuildDisplay()
+      if (root.menuGuardsPending) Qt.callLater(function() { root.evaluateMenuGuards() })
+    }
+  }
+
   PanelWindow {
     id: panel
     visible: root.opened
@@ -608,7 +1234,17 @@ Item {
         Keys.onPressed: function(event) {
           if (event.key === Qt.Key_Escape) {
             if (root.filterText) root.setFilter("")
+            else if (root.activeMenu !== "root") root.menuGoBack()
             else root.dismiss()
+            event.accepted = true
+          } else if ((event.key === Qt.Key_Backspace || event.key === Qt.Key_Left) && !root.filterText) {
+            root.menuGoBack()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Right) {
+            if (displayModel.count > 0) {
+              var rightRow = displayModel.get(root.selectedIndex)
+              if (rightRow.kind === "menu") root.menuGoTo(rightRow.menuId || "")
+            }
             event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))
@@ -669,7 +1305,7 @@ Item {
 
             Text {
               width: parent.width - 40
-              text: root.filterText || "Search apps, files, extensions, commands, math, URLs…"
+              text: root.filterText || root.headerHint()
               color: root.foreground
               opacity: root.filterText ? 1 : 0.58
               font.family: root.fontFamily
@@ -808,7 +1444,7 @@ Item {
           Text {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: "↵ open   ·   ↑↓ navigate   ·   *.ext files   ·   cd dir   ·   esc close"
+            text: "↵ open   ·   ← back   ·   ↑↓ navigate   ·   *.ext files   ·   cd dir   ·   esc close"
             color: root.foreground
             opacity: 0.45
             font.family: root.fontFamily

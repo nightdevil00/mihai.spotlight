@@ -18,6 +18,7 @@ Built as an [Omarchy plugin](https://github.com/basecamp/omarchy) on top of Quic
 - **Open URLs** — anything that looks like a link (`example.com`, `www.foo.org`) opens in your default browser
 - **Inline calculator** — type an expression like `(1920 * 2) / 3`; press Enter to copy the result to the clipboard
 - **Quick actions** — screenshot (region/fullscreen), screen recording, lock screen, night light toggle
+- **Omarchy menu built in** — the full `omarchy.menu` tree lives inside Spotlight. It opens at the menu's root (Apps, Learn, Trigger, Style…); submenu rows drill into their section right in Spotlight (`←` goes back), action rows run their command directly, and the Apps and Fonts sections list their entries natively. Entries hidden by `when:` conditions stay hidden, and `checked:` rows carry a ✓
 - **Folder jump list** — Downloads, Documents, Omarchy/Hyprland config, etc.
 
 ## Installation
@@ -36,7 +37,7 @@ Pick whatever combo you like — `ALT + SPACE` is just a suggestion.
 
 ## Usage
 
-Summon the overlay and just start typing. Results are grouped: calculator → URLs → terminal folders → commands → binaries → actions → folders → apps → files.
+Summon the overlay and just start typing — or use it like the Omarchy menu: the root sections are listed, `Enter`/`→` drills into a section, `←`/`Esc` goes back. Results when typing are grouped: calculator → URLs → terminal folders → commands → binaries → actions → menu matches → folders → apps.
 
 | Input | Result |
 |---|---|
@@ -50,15 +51,20 @@ Summon the overlay and just start typing. Results are grouped: calculator → UR
 | `github.com` | Opens in default browser |
 | `128*42+7` | Shows `128*42+7 = 5383`, Enter copies it |
 | `lock`, `record`, `night` | Quick system actions |
+| `theme` | Runs the omarchy Theme picker (Style › Theme action) |
+| `apps` | Opens the Apps menu inside Spotlight — browse/launch any installed app |
+| `install steam` | Runs the Install › Gaming › Steam action |
 
 ### Keys
 
 | Key | Action |
 |---|---|
-| `Enter` | Open / run selected result |
+| `Enter` | Open / run / drill into selected result |
+| `→` | Drill into selected menu section |
+| `←` / `Backspace` | Go back to the previous menu section |
 | `↑` / `↓` | Navigate results |
 | `PgUp` / `PgDn` | Jump to first / last |
-| `Esc` | Clear query, then dismiss |
+| `Esc` | Clear query, go back, then dismiss |
 | Click outside | Dismiss |
 
 ## Requirements

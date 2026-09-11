@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "mihai.spotlight",
   "name": "Spotlight",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "mihai",
   "license": "MIT",
   "description": "Spotlight-style launcher: fuzzy-search apps, find any file, and open URLs in your default browser",
