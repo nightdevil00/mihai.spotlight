@@ -67,6 +67,21 @@ Summon the overlay and just start typing — or use it like the Omarchy menu: th
 | `Esc` | Clear query, go back, then dismiss |
 | Click outside | Dismiss |
 
+## How the Omarchy menu is built in
+
+Spotlight loads the same menu tree as the `omarchy.menu` plugin — the default `omarchy-menu.jsonc` extended by your user overrides in `~/.config/omarchy/extensions/omarchy-menu.jsonc` — and renders it natively. The `omarchy.menu` plugin is never summoned or shelled out to.
+
+- **On open** you land on the menu root — Apps, Learn, Trigger, Style, Setup, Install, Remove, Update, About, System — the same view the real menu shows at its root.
+- **Drill into a section** with `Enter`, `→`, or a click. The header shows your path as a breadcrumb while you're inside (e.g. `‹ Style › Font`).
+- **Go back** with `←`, `Backspace`, or `Esc` while the search box is empty; `Esc` clears your query first if you're typing. At the root, `Esc` dismisses.
+- Each section lists its **children**, with `when:` conditions applied — so hardware-dependent sections disappear on unsupported machines, exactly like the real menu.
+- The **Apps** section lists your installed apps alphabetically via the same apps provider the real menu uses.
+- The **Fonts** section (`Style › Font`) runs the real menu's font provider: your current font is marked and `Enter` opens the default font picker for the selected font.
+- **Action entries** (Theme picker, `install steam`, the DNS presets, …) run their command straight from Spotlight and close the overlay.
+- **Link entries** (most of Learn) open their target in your browser and close the overlay.
+- **`checked:` rows** carry a `✓` wherever the real menu would show one.
+- **Search is scoped like the real menu**: while inside a section, typing searches that section and its descendants; at the root, typing searches the whole tree alongside apps, files, and commands as usual. Matching menu entries appear in the results either as a section (drill in) or an action (run).
+
 ## Requirements
 
 - [Omarchy](https://omarchy.org) (plugin system + omarchy-shell)
